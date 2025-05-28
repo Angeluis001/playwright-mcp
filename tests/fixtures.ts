@@ -16,8 +16,9 @@
 
 import fs from 'fs';
 import url from 'url';
+import net from 'net';
 import path from 'path';
-import { chromium } from 'playwright';
+import { chromium, Page } from 'playwright';
 
 import { test as baseTest, expect as baseExpect } from '@playwright/test';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -29,7 +30,7 @@ import type { BrowserContext } from 'playwright';
 
 export type TestOptions = {
   mcpBrowser: string | undefined;
-  mcpMode: 'docker' | undefined;
+  mcpMode: 'docker' | 'extension' | undefined;
 };
 
 type CDPServer = {
@@ -39,6 +40,7 @@ type CDPServer = {
 
 type TestFixtures = {
   client: Client;
+  clientOutputLines: string[];
   visionClient: Client;
   startClient: (options?: { clientName?: string, args?: string[], config?: Config }) => Promise<Client>;
   wsEndpoint: string;
@@ -46,10 +48,12 @@ type TestFixtures = {
   server: TestServer;
   httpsServer: TestServer;
   mcpHeadless: boolean;
+  mcpExtensionPage: Page | undefined;
 };
 
 type WorkerFixtures = {
   _workerServers: { server: TestServer, httpsServer: TestServer };
+  _clientOutputLinesHelper: { socketPath: string, outputLines: string[], clear: () => void };
 };
 
 export const test = baseTest.extend<TestFixtures & TestOptions, WorkerFixtures>({
@@ -58,16 +62,51 @@ export const test = baseTest.extend<TestFixtures & TestOptions, WorkerFixtures>(
     await use(await startClient());
   },
 
+  clientOutputLines: async ({ _clientOutputLinesHelper }, use) => {
+    _clientOutputLinesHelper.clear();
+    await use(_clientOutputLinesHelper.outputLines);
+  },
+
+  _clientOutputLinesHelper: [async ({}, use) => {
+    const socketPath = test.info().outputPath('client-socket');
+    const outputLines: string[] = [];
+    const server = net.createServer();
+    const connections = new Set<net.Socket>();
+    server.on('connection', socket => {
+      connections.add(socket);
+      socket.on('close', () => connections.delete(socket));
+      socket.on('data', data => outputLines.push(data.toString()));
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.on('error', error => reject(error));
+      server.listen(socketPath, () => resolve());
+    });
+    await use({
+      socketPath,
+      outputLines,
+      clear: () => {
+        for (const connection of connections)
+          connection.destroy();
+        outputLines.length = 0;
+      },
+    });
+    await new Promise<void>(resolve => {
+      server.close(() => resolve());
+    });
+  }, { scope: 'worker' }],
+
   visionClient: async ({ startClient }, use) => {
     await use(await startClient({ args: ['--vision'] }));
   },
 
-  startClient: async ({ mcpHeadless, mcpBrowser, mcpMode }, use, testInfo) => {
+  startClient: async ({ mcpHeadless, mcpBrowser, mcpMode, mcpExtensionPage, clientOutputLines, _clientOutputLinesHelper }, use, testInfo) => {
     const userDataDir = testInfo.outputPath('user-data-dir');
     const configDir = path.dirname(test.info().config.configFile!);
     let client: Client | undefined;
 
     await use(async options => {
+      if (client)
+        throw new Error('Client already started');
       const args = ['--user-data-dir', path.relative(configDir, userDataDir)];
       if (process.env.CI && process.platform === 'linux')
         args.push('--no-sandbox');
@@ -75,6 +114,8 @@ export const test = baseTest.extend<TestFixtures & TestOptions, WorkerFixtures>(
         args.push('--headless');
       if (mcpBrowser)
         args.push(`--browser=${mcpBrowser}`);
+      if (mcpMode === 'extension')
+        args.push('--extension');
       if (options?.args)
         args.push(...options.args);
       if (options?.config) {
@@ -84,8 +125,20 @@ export const test = baseTest.extend<TestFixtures & TestOptions, WorkerFixtures>(
       }
 
       client = new Client({ name: options?.clientName ?? 'test', version: '1.0.0' });
-      const transport = createTransport(args, mcpMode);
+      const transport = createTransport(args, mcpMode, _clientOutputLinesHelper.socketPath);
       await client.connect(transport);
+      if (mcpMode === 'extension' && mcpExtensionPage) {
+        const browserConnectCall = client.callTool({
+          name: 'browser_connect',
+          arguments: {},
+        });
+        await expect.poll(() => clientOutputLines.filter(line => line.startsWith('open call to: ')), { timeout: test.info().timeout }).toHaveLength(1);
+        const openCallURL = clientOutputLines.filter(line => line.startsWith('open call to: '))[0].split('open call to: ')[1];
+        await mcpExtensionPage.goto(openCallURL);
+        await mcpExtensionPage.getByRole('button', { name: 'Allow Connection' }).click();
+        await expect(mcpExtensionPage.getByRole('heading', { name: 'Connection Established' })).toBeVisible();
+        await browserConnectCall;
+      }
       await client.ping();
       return client;
     });
@@ -128,6 +181,29 @@ export const test = baseTest.extend<TestFixtures & TestOptions, WorkerFixtures>(
 
   mcpMode: [undefined, { option: true }],
 
+  mcpExtensionPage: async ({ mcpMode, mcpHeadless }, use) => {
+    if (mcpMode !== 'extension')
+      return await use(undefined);
+    const cdpPort = 8900 + test.info().parallelIndex * 4;
+    const pathToExtension = path.join(url.fileURLToPath(import.meta.url), '../../extension');
+    const context = await chromium.launchPersistentContext('', {
+      headless: mcpHeadless,
+      args: [
+        `--disable-extensions-except=${pathToExtension}`,
+        `--load-extension=${pathToExtension}`,
+        '--enable-features=AllowContentInitiatedDataUrlNavigations',
+      ],
+      channel: 'chromium',
+      ...{ assistantMode: true, cdpPort },
+    });
+    const page = context.pages()[0];
+    // Do not auto dismiss dialogs.
+    page.on('dialog', () => {});
+    await expect.poll(() => context?.serviceWorkers()).toHaveLength(1);
+    await use(page);
+    await context?.close();
+  },
+
   _workerServers: [async ({}, use, workerInfo) => {
     const port = 8907 + workerInfo.workerIndex * 4;
     const server = await TestServer.create(port);
@@ -154,7 +230,7 @@ export const test = baseTest.extend<TestFixtures & TestOptions, WorkerFixtures>(
   },
 });
 
-function createTransport(args: string[], mcpMode: TestOptions['mcpMode']) {
+function createTransport(args: string[], mcpMode: TestOptions['mcpMode'], outputLinesSocketPath: string) {
   // NOTE: Can be removed when we drop Node.js 18 support and changed to import.meta.filename.
   const __filename = url.fileURLToPath(import.meta.url);
   if (mcpMode === 'docker') {
@@ -168,7 +244,10 @@ function createTransport(args: string[], mcpMode: TestOptions['mcpMode']) {
     command: 'node',
     args: [path.join(path.dirname(__filename), '../cli.js'), ...args],
     cwd: path.join(path.dirname(__filename), '..'),
-    env: process.env as Record<string, string>,
+    env: {
+      ...process.env,
+      OUTPUT_LINES_SOCKET_PATH: outputLinesSocketPath,
+    },
   });
 }
 

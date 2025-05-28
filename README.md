@@ -160,6 +160,9 @@ Playwright MCP server supports following arguments. They can be provided in the 
                                example "1280, 720"
   --vision                     Run server that uses screenshots (Aria snapshots
                                are used by default)
+  --extension                  Allow connecting to a running browser instance
+                               (Edge/Chrome only). Requires the 'Playwright MCP'
+                               browser extension to be installed.
 ```
 
 <!--- End of options generated section -->
@@ -597,6 +600,14 @@ X Y coordinate space, based on the provided screenshot.
     - `width` (number): Width of the browser window
     - `height` (number): Height of the browser window
   - Read-only: **true**
+
+<!-- NOTE: This has been generated via update-readme.js -->
+
+- **browser_connect**
+  - Title: Connect to a running browser
+  - Description: If the user explicitly asks to connect to a running browser, use this tool to initiate the connection.
+  - Parameters: None
+  - Read-only: **false**
 
 </details>
 

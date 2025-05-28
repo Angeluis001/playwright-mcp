@@ -37,6 +37,7 @@ import testTools from '../lib/tools/testing.js';
 import visionTools from '../lib/tools/vision.js';
 import waitTools from '../lib/tools/wait.js';
 import { execSync } from 'node:child_process';
+import extensionTools from '../lib/tools/extension.js';
 
 const categories = {
   'Interactions': [
@@ -58,6 +59,7 @@ const categories = {
   'Utilities': [
     ...installTools,
     ...commonTools(true),
+    ...extensionTools,
   ],
   'Tabs': [
     ...tabsTools(true),

@@ -31,8 +31,11 @@ const navigate: ToolFactory = captureSnapshot => defineTool({
   },
 
   handle: async (context, params) => {
+    console.error('browser_navigate tool 1')
     const tab = await context.ensureTab();
+    console.error('browser_navigate tool 2')
     await tab.navigate(params.url);
+    console.error('browser_navigate tool 3')
 
     const code = [
       `// Navigate to ${params.url}`,

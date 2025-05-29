@@ -23,20 +23,25 @@ import { snapshotTools, visionTools } from './tools.js';
 
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { FullConfig, validateConfig } from './config.js';
-import extension from './tools/extension.js';
+import { CDPBridgeServer } from './cdp-relay.js';
 
 export async function createConnection(config: FullConfig): Promise<Connection> {
   const allTools = config.vision ? visionTools : snapshotTools;
   const tools = allTools.filter(tool => !config.capabilities || tool.capability === 'core' || config.capabilities.includes(tool.capability));
   validateConfig(config);
-  if (config.extension)
-    tools.push(...extension);
+  let cdpRelayServer: CDPBridgeServer | undefined;
+  if (config.extension) {
+    cdpRelayServer = new CDPBridgeServer(9223);
+    await cdpRelayServer.start();
+    config.browser.cdpEndpoint = `ws://localhost:${cdpRelayServer.port}/cdp`;
+  }
   const context = new Context(tools, config);
   const server = new Server({ name: 'Playwright', version: packageJSON.version }, {
     capabilities: {
       tools: {},
     }
   });
+  server.onclose = () => cdpRelayServer?.stop();
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {

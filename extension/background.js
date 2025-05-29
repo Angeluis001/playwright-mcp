@@ -1,196 +1,251 @@
 // @ts-check
 
 /**
- * @typedef {{tabId: number}} DebuggerTarget
+ * Simple Chrome Extension that pumps CDP messages between chrome.debugger and WebSocket
  */
 
 function debugLog(...args) {
   const enabled = true;
   if (enabled) {
-    console.log(...args);
+    console.log('[Extension]', ...args);
   }
 }
 
-class Extension {
+class TabShareExtension {
   constructor() {
-    chrome.tabs.onUpdated.addListener((this.onTabsUpdated.bind(this)));
-    this.adapters = /** @type {Map<number, CDPAdapter>} */ (new Map());
+    this.activeConnections = new Map(); // tabId -> connection info
+    this.bridgeURL = 'ws://localhost:9223/extension'; // Default bridge URL
+    
+    // Set up page action
+    chrome.action.onClicked.addListener(this.onPageActionClicked.bind(this));
+    chrome.tabs.onRemoved.addListener(this.onTabRemoved.bind(this));
   }
 
   /**
-   * @param {number} tabId 
-   * @param {chrome.tabs.TabChangeInfo} changeInfo 
+   * Handle page action click - "share" the tab with MCP server
    * @param {chrome.tabs.Tab} tab 
    */
-  async onTabsUpdated(tabId, changeInfo, tab) {
-    if (changeInfo.status !== 'complete' || !tab.url)
-      return;
-    const url = new URL(tab.url);
-    if (url.hostname !== 'demo.playwright.dev' || url.pathname !== '/mcp.html')
-      return;
-    const params = new URLSearchParams(url.search);
-    const proxyURL = params.get('connectionURL');
-    if (!proxyURL)
-      return;
-    if (this.adapters.has(tabId)) {
-      debugLog(`Already attached to tab: ${tabId}`);
-      return;
-    }
-    debugLog(`Attaching debugger to tab: ${tabId}`);
-    {
-      // Ask for user approval
-      await chrome.tabs.update(tabId, { url: chrome.runtime.getURL('prompt.html') });
-      await new Promise((resolve) => {
-        const listener = (message, foo) => {
-          if (foo.tab.id === tabId && message.action === 'approve') {
-            chrome.runtime.onMessage.removeListener(listener);
-            resolve(undefined);
-          }
-        };
-        chrome.runtime.onMessage.addListener(listener);
-      });
-    }
-    const debuggee = { tabId }
-    await chrome.debugger.attach(debuggee, '1.3')
-    if (chrome.runtime.lastError) {
-      debugLog('Failed to attach debugger:', chrome.runtime.lastError.message);
-      return;
-    }
-    debugLog('Debugger attached to tab:', debuggee.tabId);
-    const { targetId, browserContextId } = (/** @type{any} */ (await chrome.debugger.sendCommand(debuggee, 'Target.getTargetInfo', {}))).targetInfo;
-    const socket = new WebSocket(proxyURL);
-    const adapter = new CDPAdapter(tabId);
-    adapter.dispatch = (data) => {
-      debugLog('Sending message to browser:', data);
-      if (socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify(data));
-      } else {
-        debugLog('WebSocket is not open. Cannot send data.');
-      }
-    }
-    adapter.onClose = async () => {
-      debugLog('Debugger detached from tab:', tabId);
-      this.adapters.delete(tabId);
-      if (socket.readyState === WebSocket.OPEN)
-        socket.close();
-    }
-    socket.addEventListener('open', () => {
-      chrome.tabs.update(debuggee.tabId, { url: chrome.runtime.getURL('success.html') });
-    });
-    socket.addEventListener('message', (e) => adapter.onBrowserMessage(targetId, browserContextId, e));
-    socket.addEventListener('error', (event) => {
-      debugLog('WebSocket error:', event);
-      adapter.detach();
-    });
-    socket.addEventListener('close', async () => {
-      adapter.detach();
-    });
-    this.adapters.set(tabId, adapter);
-  }
-}
+  async onPageActionClicked(tab) {
+    if (!tab.id) return;
 
-class CDPAdapter {
-  /**
-   * @param {number} tabId
-   */
-  constructor(tabId) {
-    chrome.debugger.onEvent.addListener((this._onDebuggerEvent.bind(this)));
-    chrome.debugger.onDetach.addListener(this._onDebuggerDetach.bind(this));
-    this.onClose = () => { }
-    this.dispatch = (data) => { }
-    this._debuggee = { tabId };
+    if (this.activeConnections.has(tab.id)) {
+      // Already connected - disconnect
+      await this.disconnectTab(tab.id);
+      chrome.action.setBadgeText({ tabId: tab.id, text: '' });
+      chrome.action.setTitle({ tabId: tab.id, title: 'Share tab with Playwright MCP' });
+    } else {
+      // Connect tab
+      await this.connectTab(tab.id);
+    }
   }
 
   /**
-   * @param {string} targetId 
-   * @param {string} browserContextId 
-   * @param {object} event 
-   * @returns 
+   * Connect a tab to the bridge server
+   * @param {number} tabId 
    */
-  async onBrowserMessage(targetId, browserContextId, event) {
+  async connectTab(tabId) {
     try {
-      const message = JSON.parse(await event.data.text());
-      if (message.method === 'Browser.getVersion') {
-        // Handle the Browser.getVersion command
-        let versionInfo = {
-          protocolVersion: '1.3',
-          userAgent: navigator.userAgent,
-          product: 'Chrome'
+      debugLog(`Connecting tab ${tabId} to bridge`);
+
+      // Attach chrome debugger
+      const debuggee = { tabId };
+      await chrome.debugger.attach(debuggee, '1.3');
+      
+      if (chrome.runtime.lastError) {
+        throw new Error(chrome.runtime.lastError.message);
+      }
+
+      // Get target info including browserContextId
+      const targetInfo = await chrome.debugger.sendCommand(debuggee, 'Target.getTargetInfo', {});
+      debugLog('Target info:', targetInfo);
+
+      // Connect to bridge server
+      const socket = new WebSocket(this.bridgeURL);
+      
+      const connection = {
+        debuggee,
+        socket,
+        tabId,
+        targetId: targetInfo.targetInfo.targetId,
+        browserContextId: targetInfo.targetInfo.browserContextId
+      };
+
+      await new Promise((resolve, reject) => {
+        socket.onopen = () => {
+          debugLog(`WebSocket connected for tab ${tabId}`);
+          // Send initial connection info to bridge
+          socket.send(JSON.stringify({
+            type: 'connection_info',
+            tabId,
+            targetId: connection.targetId,
+            browserContextId: connection.browserContextId,
+            targetInfo: targetInfo.targetInfo
+          }));
+          resolve(undefined);
         };
-        this.dispatch({ id: message.id, result: versionInfo });
-        return;
-      }
-      if (message.method === 'Target.setAutoAttach' && !message.sessionId) {
-        this.dispatch({
-          method: 'Target.attachedToTarget',
-          params: {
-            sessionId: 'dummy-session-id',
-            targetInfo: {
-              targetId,
-              browserContextId,
-              type: 'page',
-              title: '',
-              url: 'data:text/html,',
-              attached: true,
-              canAccessOpener: false,
-            },
-            waitingForDebugger: false
-          }
-        })
-        this.dispatch({ id: message.id, result: {} });
-        return;
-      }
-      if (message.method === 'Browser.setDownloadBehavior') {
-        this.dispatch({ id: message.id, result: {} });
-        return;
-      }
-      if (message.method) {
-        debugLog('Received command from WebSocket:', message);
-        chrome.debugger.sendCommand(this._debuggee, message.method, message.params).then(response => {
-          // Send back the response to the WebSocket server.
-          let reply = {
-            id: message.id,  // echo back the command id if provided
-            result: response,
-            error: chrome.runtime.lastError ? chrome.runtime.lastError.message : null,
+        socket.onerror = reject;
+        setTimeout(() => reject(new Error('Connection timeout')), 5000);
+      });
+
+      // Set up message handling
+      this.setupMessageHandling(connection);
+      
+      // Store connection
+      this.activeConnections.set(tabId, connection);
+      
+      // Update UI
+      chrome.action.setBadgeText({ tabId, text: '●' });
+      chrome.action.setBadgeBackgroundColor({ tabId, color: '#4CAF50' });
+      chrome.action.setTitle({ tabId, title: 'Disconnect from Playwright MCP' });
+      
+      debugLog(`Tab ${tabId} connected successfully`);
+      
+    } catch (error) {
+      debugLog(`Failed to connect tab ${tabId}:`, error.message);
+      await this.cleanupConnection(tabId);
+      
+      // Show error to user
+      chrome.action.setBadgeText({ tabId, text: '!' });
+      chrome.action.setBadgeBackgroundColor({ tabId, color: '#F44336' });
+      chrome.action.setTitle({ tabId, title: `Connection failed: ${error.message}` });
+    }
+  }
+
+  /**
+   * Set up bidirectional message handling between debugger and WebSocket
+   * @param {Object} connection 
+   */
+  setupMessageHandling(connection) {
+    const { debuggee, socket, tabId } = connection;
+
+    // WebSocket -> chrome.debugger
+    socket.onmessage = async (event) => {
+      try {
+        const message = JSON.parse(event.data);
+        debugLog('Received from bridge:', message);
+        
+        // Forward CDP command to chrome.debugger
+        if (message.method) {
+          const result = await chrome.debugger.sendCommand(
+            debuggee, 
+            message.method, 
+            message.params || {}
+          );
+          
+          // Send response back to bridge
+          const response = {
+            id: message.id,
+            result: result || {},
             sessionId: message.sessionId
           };
-          this.dispatch(reply);
-        });
+          
+          if (chrome.runtime.lastError) {
+            response.error = { message: chrome.runtime.lastError.message };
+          }
+          
+          socket.send(JSON.stringify(response));
+        }
+      } catch (error) {
+        debugLog('Error processing WebSocket message:', error);
       }
-    } catch (e) {
-      debugLog('Error processing WebSocket message:', e);
-    }
-  }
-
-  /**
-   * @param {chrome.debugger.DebuggerSession} source 
-   * @param {string} method 
-   * @param {Object} params 
-   */
-  _onDebuggerEvent(source, method, params) {
-    debugLog('CDP event:', method, params);
-    let eventData = {
-      method: method,
-      params: params,
-      sessionId: 'dummy-session-id', // Use a dummy session ID for now
     };
-    this.dispatch(eventData);
+
+    // chrome.debugger events -> WebSocket
+    const eventListener = (source, method, params) => {
+      if (source.tabId === tabId && socket.readyState === WebSocket.OPEN) {
+        const event = {
+          method,
+          params,
+          sessionId: 'bridge-session-1',
+          targetId: connection.targetId,
+          browserContextId: connection.browserContextId
+        };
+        debugLog('Forwarding CDP event:', event);
+        socket.send(JSON.stringify(event));
+      }
+    };
+
+    const detachListener = (source, reason) => {
+      if (source.tabId === tabId) {
+        debugLog(`Debugger detached from tab ${tabId}, reason: ${reason}`);
+        this.disconnectTab(tabId);
+      }
+    };
+
+    // Store listeners for cleanup
+    connection.eventListener = eventListener;
+    connection.detachListener = detachListener;
+
+    chrome.debugger.onEvent.addListener(eventListener);
+    chrome.debugger.onDetach.addListener(detachListener);
+
+    // Handle WebSocket close
+    socket.onclose = () => {
+      debugLog(`WebSocket closed for tab ${tabId}`);
+      this.disconnectTab(tabId);
+    };
+
+    socket.onerror = (error) => {
+      debugLog(`WebSocket error for tab ${tabId}:`, error);
+      this.disconnectTab(tabId);
+    };
   }
 
   /**
-   * @param {chrome.debugger.DetachReason} reason
+   * Disconnect a tab from the bridge
+   * @param {number} tabId 
    */
-  _onDebuggerDetach(reason) {
-    debugLog(`Debugger detached from tab: ${this._debuggee.tabId} with reason: ${reason}`);
-    this.onClose();
+  async disconnectTab(tabId) {
+    await this.cleanupConnection(tabId);
+    
+    // Update UI
+    chrome.action.setBadgeText({ tabId, text: '' });
+    chrome.action.setTitle({ tabId, title: 'Share tab with Playwright MCP' });
+    
+    debugLog(`Tab ${tabId} disconnected`);
   }
 
-  async detach() {
-    await chrome.debugger.detach(this._debuggee);
-    chrome.debugger.onEvent.removeListener(this._onDebuggerEvent.bind(this));
-    chrome.debugger.onDetach.removeListener(this._onDebuggerDetach.bind(this));
-    this.onClose();
+  /**
+   * Clean up connection resources
+   * @param {number} tabId 
+   */
+  async cleanupConnection(tabId) {
+    const connection = this.activeConnections.get(tabId);
+    if (!connection) return;
+
+    // Remove listeners
+    if (connection.eventListener) {
+      chrome.debugger.onEvent.removeListener(connection.eventListener);
+    }
+    if (connection.detachListener) {
+      chrome.debugger.onDetach.removeListener(connection.detachListener);
+    }
+
+    // Close WebSocket
+    if (connection.socket && connection.socket.readyState === WebSocket.OPEN) {
+      connection.socket.close();
+    }
+
+    // Detach debugger
+    try {
+      await chrome.debugger.detach(connection.debuggee);
+    } catch (error) {
+      // Ignore detach errors - might already be detached
+    }
+
+    this.activeConnections.delete(tabId);
+  }
+
+  /**
+   * Handle tab removal
+   * @param {number} tabId 
+   */
+  async onTabRemoved(tabId) {
+    if (this.activeConnections.has(tabId)) {
+      await this.cleanupConnection(tabId);
+    }
   }
 }
 
-new Extension();
+// Initialize extension
+new TabShareExtension();

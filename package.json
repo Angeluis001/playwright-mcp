@@ -40,7 +40,6 @@
     "@modelcontextprotocol/sdk": "^1.11.0",
     "@types/ws": "^8.18.1",
     "debug": "^4.4.0",
-    "open": "10.1.1",
     "ws": "^8.18.1",
     "yaml": "^2.7.1",
     "zod-to-json-schema": "^3.24.4"

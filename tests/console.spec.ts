@@ -27,12 +27,14 @@ test('browser_console_messages', async ({ client, server }) => {
     </html>
   `, 'text/html');
 
+      console.log('creating client')
   await client.callTool({
     name: 'browser_navigate',
     arguments: {
       url: server.PREFIX,
     },
   });
+      console.log('creating client')
 
   const resource = await client.callTool({
     name: 'browser_console_messages',

@@ -24,7 +24,7 @@ import { createConnection } from '@playwright/mcp';
 
 test.skip(({ mcpMode }) => mcpMode !== 'extension');
 
-test('allow re-connecting to a browser', async ({ client, clientOutputLines, mcpExtensionPage }) => {
+test('allow re-connecting to a browser', async ({ client, mcpExtensionPage }) => {
   assert(mcpExtensionPage, 'mcpExtensionPage is required for this test');
   await client.callTool({
     name: 'browser_navigate',

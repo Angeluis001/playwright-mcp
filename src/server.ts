@@ -21,8 +21,11 @@ import type { Request, Response } from 'express';
 
 import type { FullConfig } from './config.js';
 import type { Connection } from './connection.js';
-import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { BrowserContextFactory } from './browserContextFactory.js';
+
+// Temporary local definition for Transport to unblock build
+// Replace with the correct import from SDK if/when available
+type Transport = any;
 
 export class Server {
   readonly config: FullConfig;

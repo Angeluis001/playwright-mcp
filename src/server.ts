@@ -16,10 +16,12 @@
 
 import { createConnection } from './connection.js';
 import { contextFactory } from './browserContextFactory.js';
+import express from 'express';
+import type { Request, Response } from 'express';
 
 import type { FullConfig } from './config.js';
 import type { Connection } from './connection.js';
-import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+import { Transport } from '@modelcontextprotocol/sdk';
 import type { BrowserContextFactory } from './browserContextFactory.js';
 
 export class Server {
@@ -27,11 +29,29 @@ export class Server {
   private _connectionList: Connection[] = [];
   private _browserConfig: FullConfig['browser'];
   private _contextFactory: BrowserContextFactory;
+  private _httpServer: express.Application = express();
+  private _port: number;
 
   constructor(config: FullConfig) {
     this.config = config;
     this._browserConfig = config.browser;
     this._contextFactory = contextFactory(this._browserConfig);
+    this._port = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+    this._setupHttpServer();
+  }
+
+  private _setupHttpServer() {    
+    this._httpServer.get('/', (_req: Request, res: Response) => {
+      res.json({ status: 'Playwright MCP Server is running' });
+    });
+
+    this._httpServer.get('/health', (_req: Request, res: Response) => {
+      res.json({ status: 'healthy', connections: this._connectionList.length });
+    });
+
+    this._httpServer.listen(this._port, () => {
+      console.log(`Server is running on port ${this._port}`);
+    });
   }
 
   async createConnection(transport: Transport): Promise<Connection> {
@@ -49,6 +69,10 @@ export class Server {
       isExiting = true;
       setTimeout(() => process.exit(0), 15000);
       await Promise.all(this._connectionList.map(connection => connection.close()));
+      if (this._httpServer) {
+        const server = this._httpServer.listen().close();
+        server.close();
+      }
       process.exit(0);
     };
 

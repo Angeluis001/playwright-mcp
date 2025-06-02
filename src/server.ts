@@ -21,7 +21,7 @@ import type { Request, Response } from 'express';
 
 import type { FullConfig } from './config.js';
 import type { Connection } from './connection.js';
-import { Transport } from '@modelcontextprotocol/sdk';
+import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { BrowserContextFactory } from './browserContextFactory.js';
 
 export class Server {
